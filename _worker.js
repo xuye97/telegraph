@@ -82,6 +82,7 @@ function extractConfig(env) {
     databaseBindingName: databaseBinding.bindingName,
     username: env.USERNAME,
     password: env.PASSWORD,
+    apiSecret: env.API_SECRET,
     sessionSecret: env.SESSION_SECRET || env.PASSWORD,
     adminPath: normalizeAdminPath(env.ADMIN_PATH),
     enableAuth: env.ENABLE_AUTH === 'true',
@@ -135,6 +136,12 @@ async function ensureDatabaseSchema(database) {
       if (!columnNames.has('originalName')) {
         await database.prepare(`ALTER TABLE media ADD COLUMN originalName TEXT`).run();
       }
+      await database.prepare(`
+        CREATE TABLE IF NOT EXISTS api_nonces (
+          nonce TEXT PRIMARY KEY,
+          expiresAt INTEGER NOT NULL
+        )
+      `).run();
     })();
     databaseSchemaPromises.set(database, schemaPromise);
     schemaPromise.catch(() => databaseSchemaPromises.delete(database));
@@ -400,6 +407,72 @@ async function hasValidSession(request, config) {
 async function isAuthenticated(request, config) {
   return authenticate(request, config.username, config.password)
       || await hasValidSession(request, config);
+}
+
+function bytesToHex(bytes) {
+  return Array.from(new Uint8Array(bytes), byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function hexToBytes(value) {
+  if (!/^(?:[0-9a-f]{2})+$/i.test(value)) return null;
+  return Uint8Array.from(value.match(/.{2}/g), byte => Number.parseInt(byte, 16));
+}
+
+async function authenticateApiRequest(request, config) {
+  const authorization = request.headers.get('Authorization') || '';
+  const authMatch = authorization.match(/^HMAC-SHA256 (\d{10}):([0-9a-f]{32,128}):([0-9a-f]{64})$/i);
+  const username = request.headers.get('X-Auth-Username') || '';
+  if (!authMatch || username !== config.username || !config.apiSecret || config.apiSecret.length < 32) return false;
+
+  const timestamp = Number(authMatch[1]);
+  const nonce = authMatch[2].toLowerCase();
+  const signature = hexToBytes(authMatch[3]);
+  const now = Math.floor(Date.now() / 1000);
+  if (!signature || !Number.isSafeInteger(timestamp) || Math.abs(now - timestamp) > 300) return false;
+
+  try {
+    const url = new URL(request.url);
+    const body = await request.clone().arrayBuffer();
+    const bodyHash = bytesToHex(await crypto.subtle.digest('SHA-256', body));
+    const canonical = [
+      'TELEGRAPH-HMAC-SHA256',
+      username,
+      request.method.toUpperCase(),
+      `${url.pathname}${url.search}`,
+      String(timestamp),
+      nonce,
+      bodyHash
+    ].join('\n');
+    const key = await crypto.subtle.importKey(
+        'raw',
+        new TextEncoder().encode(config.apiSecret),
+        { name: 'HMAC', hash: 'SHA-256' },
+        false,
+        ['verify']
+    );
+    const validSignature = await crypto.subtle.verify(
+        'HMAC',
+        key,
+        signature,
+        new TextEncoder().encode(canonical)
+    );
+    if (!validSignature) return false;
+
+    const database = getDatabase(config);
+    await ensureDatabaseSchema(database);
+    await database.prepare('DELETE FROM api_nonces WHERE expiresAt <= ?').bind(now).run();
+    try {
+      const result = await database.prepare(
+          'INSERT INTO api_nonces (nonce, expiresAt) VALUES (?, ?)'
+      ).bind(nonce, now + 600).run();
+      return (result.meta?.changes ?? result.changes ?? 1) === 1;
+    } catch {
+      // Nonce collisions (including replay attempts) fail closed.
+      return false;
+    }
+  } catch {
+    return false;
+  }
 }
 
 function safeNextPath(value, fallback = '/') {
@@ -1604,6 +1677,10 @@ async function generateAdminPage(database, page = 1, config) {
           <i class="fa-solid fa-upload text-indigo-500 dark:text-indigo-400"></i>
           <span>上传中心</span>
         </a>
+        <a href="/docs" class="h-9 px-3.5 rounded-xl bg-slate-100 dark:bg-white/5 hover:bg-slate-200 dark:hover:bg-white/10 border border-slate-200 dark:border-white/10 text-xs font-semibold text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white flex items-center gap-2 transition">
+          <i class="fa-solid fa-book text-indigo-500 dark:text-indigo-400"></i>
+          <span>文档</span>
+        </a>
         <form method="post" action="/logout" class="m-0">
           <button type="submit" class="h-9 w-9 rounded-xl bg-slate-100 dark:bg-white/5 hover:bg-rose-500/15 border border-slate-200 dark:border-white/10 hover:border-rose-500/30 text-slate-500 hover:text-rose-500 dark:hover:text-rose-400 flex items-center justify-center transition" title="退出登录">
             <i class="fa-solid fa-arrow-right-from-bracket text-xs"></i>
@@ -2301,19 +2378,39 @@ function renderApiDocsPage(config) {
           </div>
           <div>
             <h2 class="text-sm font-bold text-slate-800 dark:text-white">身份认证</h2>
-            <p class="text-xs text-slate-500 dark:text-slate-400 mt-0.5">所有接口必须携带 Basic Auth 凭证</p>
+            <p class="text-xs text-slate-500 dark:text-slate-400 mt-0.5">所有接口必须使用 HMAC-SHA256 请求签名</p>
           </div>
         </div>
         <div class="space-y-3">
           <p class="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
-            在请求头中添加 <code class="inline">Authorization</code>，值为 <code class="inline">Basic</code> + 空格 + 使用环境变量 <code class="inline">USERNAME</code> 与 <code class="inline">PASSWORD</code> 拼接后经 Base64 编码的字符串。
+            配置独立的 <code class="inline">API_SECRET</code>，以它计算请求体 SHA-256 和 HMAC-SHA256 签名。签名绑定用户名、HTTP 方法、完整路径/查询串、时间戳、随机 nonce 和请求体摘要。API 不接受 Basic Auth 或浏览器会话 Cookie。
           </p>
           <div class="rounded-2xl bg-slate-950 dark:bg-black/60 border border-slate-800 dark:border-white/10 p-4 overflow-x-auto">
-            <pre class="text-[12px] leading-relaxed text-slate-200 font-mono"># 生成凭证（示例）
-printf '%s:%s' "YOUR_USERNAME" "YOUR_PASSWORD" | base64</pre>
-          </div>
-          <div class="rounded-2xl bg-slate-950 dark:bg-black/60 border border-slate-800 dark:border-white/10 p-4 overflow-x-auto">
-            <pre class="text-[12px] leading-relaxed text-slate-200 font-mono">Authorization: Basic dXNlcm5hbWU6cGFzc3dvcmQ=</pre>
+            <pre class="text-[12px] leading-relaxed text-slate-200 font-mono"># Python 3 + requests；上传、删除、转存均复用此签名函数
+import hashlib, hmac, secrets, time, requests
+from urllib.parse import urlsplit
+
+API_BASE = "https://your-domain/v1/api"
+USERNAME = "YOUR_USERNAME"
+API_SECRET = "YOUR_API_SECRET"
+def signed_request(method, url, **kwargs):
+    headers = dict(kwargs.pop("headers", {}))
+    headers["X-Auth-Username"] = USERNAME
+    prepared = requests.Request(method, url, headers=headers, **kwargs).prepare()
+    body = prepared.body or b""
+    if isinstance(body, str): body = body.encode("utf-8")
+    parts = urlsplit(prepared.url)
+    target = parts.path or "/"
+    if parts.query: target += "?" + parts.query
+    timestamp, nonce = str(int(time.time())), secrets.token_hex(16)
+    body_hash = hashlib.sha256(body).hexdigest()
+    canonical = "\\n".join(["TELEGRAPH-HMAC-SHA256", USERNAME, method.upper(), target, timestamp, nonce, body_hash])
+    signature = hmac.new(API_SECRET.encode(), canonical.encode(), hashlib.sha256).hexdigest()
+    prepared.headers["Authorization"] = f"HMAC-SHA256 {timestamp}:{nonce}:{signature}"
+    return requests.Session().send(prepared)
+
+# 请求头：X-Auth-Username: USERNAME
+# Authorization: HMAC-SHA256 &lt;unix秒时间戳&gt;:&lt;随机nonce&gt;:&lt;64位小写十六进制签名&gt;</pre>
           </div>
           <div class="grid gap-2">
             <div class="flex items-start gap-2 text-xs text-slate-600 dark:text-slate-300 p-3 rounded-xl bg-slate-100/70 dark:bg-white/5 border border-slate-200/80 dark:border-white/5">
@@ -2322,7 +2419,7 @@ printf '%s:%s' "YOUR_USERNAME" "YOUR_PASSWORD" | base64</pre>
             </div>
             <div class="flex items-start gap-2 text-xs text-slate-600 dark:text-slate-300 p-3 rounded-xl bg-slate-100/70 dark:bg-white/5 border border-slate-200/80 dark:border-white/5">
               <i class="fa-solid fa-circle-info text-indigo-500 mt-0.5"></i>
-              <span>接口不支持匿名访问，<code class="inline">ENABLE_AUTH</code> 配置不适用于开放接口，认证始终开启。</span>
+              <span>时间戳与服务器时间相差不得超过 5 分钟；nonce 在 D1 中记录并拒绝重放。请始终使用 HTTPS。<code class="inline">ENABLE_AUTH</code> 不影响 API 强制签名认证。</span>
             </div>
           </div>
         </div>
@@ -2370,11 +2467,11 @@ printf '%s:%s' "YOUR_USERNAME" "YOUR_PASSWORD" | base64</pre>
         </div>
 
         <div class="space-y-2">
-          <h3 class="text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">curl 示例</h3>
+          <h3 class="text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">Python 调用示例</h3>
           <div class="rounded-2xl bg-slate-950 dark:bg-black/60 border border-slate-800 dark:border-white/10 p-4 overflow-x-auto">
-            <pre class="text-[12px] leading-relaxed text-slate-200 font-mono">curl -X POST "${escapeHtml(apiBase)}/files" \\
-  -H "Authorization: Basic dXNlcm5hbWU6cGFzc3dvcmQ=" \\
-  -F "file=@/path/to/image.png"</pre>
+            <pre class="text-[12px] leading-relaxed text-slate-200 font-mono">with open("/path/to/image.png", "rb") as file:
+    response = signed_request("POST", API_BASE + "/files", files={"file": file})
+print(response.status_code, response.json())</pre>
           </div>
         </div>
 
@@ -2440,10 +2537,13 @@ printf '%s:%s' "YOUR_USERNAME" "YOUR_PASSWORD" | base64</pre>
         </div>
 
         <div class="space-y-2">
-          <h3 class="text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">curl 示例</h3>
+          <h3 class="text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">Python 调用示例</h3>
           <div class="rounded-2xl bg-slate-950 dark:bg-black/60 border border-slate-800 dark:border-white/10 p-4 overflow-x-auto">
-            <pre class="text-[12px] leading-relaxed text-slate-200 font-mono">curl -X DELETE "${escapeHtml(apiBase)}/files?url=https://${escapeHtml(config.domain || 'your.domain')}/20261008/Ab3xYz9QkLmNpQrS/example.png" \\
-  -H "Authorization: Basic dXNlcm5hbWU6cGFzc3dvcmQ="</pre>
+            <pre class="text-[12px] leading-relaxed text-slate-200 font-mono">response = signed_request(
+    "DELETE", API_BASE + "/files",
+    params={"url": "https://your-domain/example.png"}
+)
+print(response.status_code, response.json())</pre>
           </div>
         </div>
 
@@ -2500,12 +2600,13 @@ printf '%s:%s' "YOUR_USERNAME" "YOUR_PASSWORD" | base64</pre>
         </div>
 
         <div class="space-y-2">
-          <h3 class="text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">curl 示例</h3>
+          <h3 class="text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">Python 调用示例</h3>
           <div class="rounded-2xl bg-slate-950 dark:bg-black/60 border border-slate-800 dark:border-white/10 p-4 overflow-x-auto">
-            <pre class="text-[12px] leading-relaxed text-slate-200 font-mono">curl -X POST "${escapeHtml(apiBase)}/transfer" \\
-  -H "Authorization: Basic dXNlcm5hbWU6cGFzc3dvcmQ=" \\
-  -H "Content-Type: application/json" \\
-  -d '{"url":"https://example.com/image.jpg"}'</pre>
+            <pre class="text-[12px] leading-relaxed text-slate-200 font-mono">response = signed_request(
+    "POST", API_BASE + "/transfer",
+    json={"url": "https://example.com/image.jpg"}
+)
+print(response.status_code, response.json())</pre>
           </div>
         </div>
 
@@ -2586,8 +2687,11 @@ printf '%s:%s' "YOUR_USERNAME" "YOUR_PASSWORD" | base64</pre>
 
 async function handleApiRequest(request, config, pathname) {
   validateAdminCredentials(config);
-  if (!await isAuthenticated(request, config)) {
-    return unauthorizedResponse();
+  if (!config.apiSecret || config.apiSecret.length < 32) {
+    throw new ConfigurationError('API_SECRET 必须设置为至少 32 个字符的随机密钥');
+  }
+  if (!await authenticateApiRequest(request, config)) {
+    return jsonResponse({ error: 'Unauthorized' }, 401);
   }
   if (pathname === '/v1/api/files' && request.method === 'POST') {
     return await apiUploadFile(request, config);
